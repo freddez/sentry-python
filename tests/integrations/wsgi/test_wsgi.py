@@ -1,10 +1,11 @@
+import sys
+
 from werkzeug.test import Client
 
 import pytest
 
 import sentry_sdk
 from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
-from sentry_sdk.profiler import teardown_profiler
 from collections import Counter
 
 try:
@@ -19,12 +20,6 @@ def crashing_app():
         1 / 0
 
     return app
-
-
-@pytest.fixture
-def profiling():
-    yield
-    teardown_profiler()
 
 
 class IterableApp(object):
@@ -289,12 +284,24 @@ def test_auto_session_tracking_with_aggregates(sentry_init, capture_envelopes):
     assert len(session_aggregates) == 1
 
 
-@pytest.mark.parametrize(
-    "profiles_sample_rate,should_send",
-    [(1.0, True), (0.75, True), (0.25, False), (None, False)],
+@pytest.mark.skipif(
+    sys.version_info < (3, 3), reason="Profiling is only supported in Python >= 3.3"
 )
-def test_profile_sent_when_profiling_enabled(
-    capture_envelopes, sentry_init, profiling, profiles_sample_rate, should_send
+@pytest.mark.parametrize(
+    "profiles_sample_rate,profile_count",
+    [
+        pytest.param(1.0, 1, id="profiler sampled at 1.0"),
+        pytest.param(0.75, 1, id="profiler sampled at 0.75"),
+        pytest.param(0.25, 0, id="profiler not sampled at 0.25"),
+        pytest.param(None, 0, id="profiler not enabled"),
+    ],
+)
+def test_profile_sent(
+    capture_envelopes,
+    sentry_init,
+    teardown_profiling,
+    profiles_sample_rate,
+    profile_count,
 ):
     def test_app(environ, start_response):
         start_response("200 OK", [])
@@ -311,9 +318,8 @@ def test_profile_sent_when_profiling_enabled(
         client = Client(app)
         client.get("/")
 
-    profile_sent = False
-    for item in envelopes[0].items:
-        if item.headers["type"] == "profile":
-            profile_sent = True
-            break
-    assert profile_sent == should_send
+    count_item_types = Counter()
+    for envelope in envelopes:
+        for item in envelope.items:
+            count_item_types[item.type] += 1
+    assert count_item_types["profile"] == profile_count

@@ -5,6 +5,7 @@ import functools
 
 from sentry_sdk._compat import iteritems
 from sentry_sdk._types import MYPY
+from sentry_sdk.consts import OP
 from sentry_sdk.hub import Hub, _should_send_default_pii
 from sentry_sdk.integrations import DidNotEnable, Integration
 from sentry_sdk.integrations._wsgi_common import (
@@ -21,7 +22,7 @@ from sentry_sdk.utils import (
 )
 
 if MYPY:
-    from typing import Any, Awaitable, Callable, Dict, Optional, Union
+    from typing import Any, Awaitable, Callable, Dict, Optional
 
     from sentry_sdk._types import Event
 
@@ -84,21 +85,52 @@ def _enable_span_for_middleware(middleware_class):
     # type: (Any) -> type
     old_call = middleware_class.__call__
 
-    async def _create_span_call(*args, **kwargs):
-        # type: (Any, Any) -> None
+    async def _create_span_call(app, scope, receive, send, **kwargs):
+        # type: (Any, Dict[str, Any], Callable[[], Awaitable[Dict[str, Any]]], Callable[[Dict[str, Any]], Awaitable[None]], Any) -> None
         hub = Hub.current
         integration = hub.get_integration(StarletteIntegration)
         if integration is not None:
-            middleware_name = args[0].__class__.__name__
+            middleware_name = app.__class__.__name__
+
             with hub.start_span(
-                op="starlette.middleware", description=middleware_name
+                op=OP.MIDDLEWARE_STARLETTE, description=middleware_name
             ) as middleware_span:
                 middleware_span.set_tag("starlette.middleware_name", middleware_name)
 
-                await old_call(*args, **kwargs)
+                # Creating spans for the "receive" callback
+                async def _sentry_receive(*args, **kwargs):
+                    # type: (*Any, **Any) -> Any
+                    hub = Hub.current
+                    with hub.start_span(
+                        op=OP.MIDDLEWARE_STARLETTE_RECEIVE,
+                        description=getattr(receive, "__qualname__", str(receive)),
+                    ) as span:
+                        span.set_tag("starlette.middleware_name", middleware_name)
+                        return await receive(*args, **kwargs)
+
+                receive_name = getattr(receive, "__name__", str(receive))
+                receive_patched = receive_name == "_sentry_receive"
+                new_receive = _sentry_receive if not receive_patched else receive
+
+                # Creating spans for the "send" callback
+                async def _sentry_send(*args, **kwargs):
+                    # type: (*Any, **Any) -> Any
+                    hub = Hub.current
+                    with hub.start_span(
+                        op=OP.MIDDLEWARE_STARLETTE_SEND,
+                        description=getattr(send, "__qualname__", str(send)),
+                    ) as span:
+                        span.set_tag("starlette.middleware_name", middleware_name)
+                        return await send(*args, **kwargs)
+
+                send_name = getattr(send, "__name__", str(send))
+                send_patched = send_name == "_sentry_send"
+                new_send = _sentry_send if not send_patched else send
+
+                return await old_call(app, scope, new_receive, new_send, **kwargs)
 
         else:
-            await old_call(*args, **kwargs)
+            return await old_call(app, scope, receive, send, **kwargs)
 
     not_yet_patched = old_call.__name__ not in [
         "_create_span_call",
@@ -335,10 +367,10 @@ def patch_request_response():
                         def event_processor(event, hint):
                             # type: (Dict[str, Any], Dict[str, Any]) -> Dict[str, Any]
 
-                            # Extract information from request
+                            # Add info from request to event
                             request_info = event.get("request", {})
                             if info:
-                                if "cookies" in info and _should_send_default_pii():
+                                if "cookies" in info:
                                     request_info["cookies"] = info["cookies"]
                                 if "data" in info:
                                     request_info["data"] = info["data"]
@@ -438,66 +470,71 @@ class StarletteRequestExtractor:
         if client is None:
             return None
 
-        data = None  # type: Union[Dict[str, Any], AnnotatedValue, None]
-
-        content_length = await self.content_length()
         request_info = {}  # type: Dict[str, Any]
 
         with capture_internal_exceptions():
+            # Add cookies
             if _should_send_default_pii():
                 request_info["cookies"] = self.cookies()
 
-            if not request_body_within_bounds(client, content_length):
-                data = AnnotatedValue(
-                    "",
-                    {
-                        "rem": [["!config", "x", 0, content_length]],
-                        "len": content_length,
-                    },
-                )
-            else:
-                parsed_body = await self.parsed_body()
-                if parsed_body is not None:
-                    data = parsed_body
-                elif await self.raw_data():
-                    data = AnnotatedValue(
-                        "",
-                        {
-                            "rem": [["!raw", "x", 0, content_length]],
-                            "len": content_length,
-                        },
+            # If there is no body, just return the cookies
+            content_length = await self.content_length()
+            if not content_length:
+                return request_info
+
+            # Add annotation if body is too big
+            if content_length and not request_body_within_bounds(
+                client, content_length
+            ):
+                request_info["data"] = AnnotatedValue.removed_because_over_size_limit()
+                return request_info
+
+            # Add JSON body, if it is a JSON request
+            json = await self.json()
+            if json:
+                request_info["data"] = json
+                return request_info
+
+            # Add form as key/value pairs, if request has form data
+            form = await self.form()
+            if form:
+                form_data = {}
+                for key, val in iteritems(form):
+                    is_file = isinstance(val, UploadFile)
+                    form_data[key] = (
+                        val
+                        if not is_file
+                        else AnnotatedValue.removed_because_raw_data()
                     )
-                else:
-                    data = None
 
-            if data is not None:
-                request_info["data"] = data
+                request_info["data"] = form_data
+                return request_info
 
-        return request_info
+            # Raw data, do not add body just an annotation
+            request_info["data"] = AnnotatedValue.removed_because_raw_data()
+            return request_info
 
     async def content_length(self):
-        # type: (StarletteRequestExtractor) -> int
-        raw_data = await self.raw_data()
-        if raw_data is None:
-            return 0
-        return len(raw_data)
+        # type: (StarletteRequestExtractor) -> Optional[int]
+        if "content-length" in self.request.headers:
+            return int(self.request.headers["content-length"])
+
+        return None
 
     def cookies(self):
         # type: (StarletteRequestExtractor) -> Dict[str, Any]
         return self.request.cookies
 
-    async def raw_data(self):
-        # type: (StarletteRequestExtractor) -> Any
-        return await self.request.body()
-
     async def form(self):
         # type: (StarletteRequestExtractor) -> Any
-        """
-        curl -X POST http://localhost:8000/upload/somethign -H "Content-Type: application/x-www-form-urlencoded" -d "username=kevin&password=welcome123"
-        curl -X POST http://localhost:8000/upload/somethign  -F username=Julian -F password=hello123
-        """
         if multipart is None:
             return None
+
+        # Parse the body first to get it cached, as Starlette does not cache form() as it
+        # does with body() and json() https://github.com/encode/starlette/discussions/1933
+        # Calling `.form()` without calling `.body()` first will
+        # potentially break the users project.
+        await self.request.body()
 
         return await self.request.form()
 
@@ -507,35 +544,10 @@ class StarletteRequestExtractor:
 
     async def json(self):
         # type: (StarletteRequestExtractor) -> Optional[Dict[str, Any]]
-        """
-        curl -X POST localhost:8000/upload/something -H 'Content-Type: application/json' -d '{"login":"my_login","password":"my_password"}'
-        """
         if not self.is_json():
             return None
 
         return await self.request.json()
-
-    async def parsed_body(self):
-        # type: (StarletteRequestExtractor) -> Any
-        """
-        curl -X POST http://localhost:8000/upload/somethign  -F username=Julian -F password=hello123 -F photo=@photo.jpg
-        """
-        form = await self.form()
-        if form:
-            data = {}
-            for key, val in iteritems(form):
-                if isinstance(val, UploadFile):
-                    size = len(await val.read())
-                    data[key] = AnnotatedValue(
-                        "", {"len": size, "rem": [["!raw", "x", 0, size]]}
-                    )
-                else:
-                    data[key] = val
-
-            return data
-
-        json_data = await self.json()
-        return json_data
 
 
 def _set_transaction_name_and_source(event, transaction_style, request):
